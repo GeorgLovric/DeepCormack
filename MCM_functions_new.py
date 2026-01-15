@@ -459,67 +459,6 @@ def getrho(rawdat, order, pang, nphi, ncoeff, rhofn):
 
 
 
-def getrho_anm_synth(rawdat, order, pang, nphi, ncoeff, rhofn, anm):
-    """
-    Alternate getrho: Use a custom anm matrix to calculate rhoreturn.
-
-    Parameters
-    ----------
-    rawdat : np.ndarray
-        Input projection data, shape (nsize, nsize, nproj).
-    order : int
-        Symmetry order for system (e.g. 4 for C4).
-    pang : list or np.ndarray
-        List of projection angles in degrees.
-    nphi : int
-        Number of phi angles.
-    ncoeff : int or array-like
-        Number of Zernike coefficients per projection.
-    rhofn : tuple
-        Fermi cutoff parameters (rhocut, flvl, kt).
-    anm : np.ndarray
-        Precomputed anm matrix, shape (xsize, nphi, nproj).
-
-    Returns
-    -------
-    rhoreturn : np.ndarray
-        Calculated rho array, shape (xsize, nproj, xsize).
-    """
-    nproj = rawdat.shape[2]
-    nsize = rawdat.shape[0]
-    xsize = nsize // 2
-    xstart = nsize // 2
-
-    # precompute projection matrix inverse and sin inverse (as full 2D arrays)
-    simul = setupprojs(order, pang, nproj)
-    sinmat_flat = setupsin(nphi)
-    sininv_mat = sinmat_flat.reshape((nphi, nphi), order='F')
-
-    # prepare rhofn array (fermi cutoff)
-    rhocut, flvl, kt = rhofn[0], rhofn[1], rhofn[2]
-    rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
-
-    # precompute calccos indices and interpolation
-    deltaphi = 90.0 / nphi
-    angles = np.linspace(0.0, 90.0, nphi, endpoint=True) * np.pi / 180.0
-    dists = (xsize - 1) * np.cos(angles)
-    i_idx = np.floor(dists).astype(np.int64)
-    deltax = dists - i_idx
-    valid_mask = (i_idx >= 0) & (i_idx < xsize - 1)
-
-    # precompute zernike parameters
-    r, coeff_count, nn, ni = precompute_zernike(xsize, nproj, order, nphi, ncoeff)
-
-    # call compiled core (custom version for precomputed anm)
-    rhoreturn = _getrho_anm_core(
-        rawdat, simul, sininv_mat, anm, i_idx, deltax, valid_mask,
-        r, coeff_count, nn, ni, rhofn_array, float(order), nphi, int(xstart), int(xsize)
-    )
-    return rhoreturn
-
-
-
-
 
 """Numba Accelerated Calcplane Function:"""
 
@@ -671,97 +610,17 @@ def calcplane(rhos, y_max, order):
 
 
 @njit(parallel=True, fastmath=True)
-def _getrho_anm_core(rawdat, simul, sininv_mat, anm, i_idx, deltax, valid_mask,
-                 r, coeff_count, nn, ni, rhofn_array, order, nphi, xstart, xsize):
-    nproj = rawdat.shape[2]
-    N = xsize
+def _getrho_anm_core(anm, xsize, r, coeff_count, nn, ni, rhofn_array):
+    n_samples, nphi, nproj = anm.shape
+    drho_type = np.float64
+
     # ensure y_max equals xsize
-    y_max = xsize
-    rhoreturn = np.zeros((xsize, nproj, xsize), dtype=rawdat.dtype)
-    anm_matrix = np.zeros((xsize, nphi, nproj), dtype=rawdat.dtype)
+    y_max = n_samples
+    rhoreturn = np.zeros((xsize, nproj, n_samples), dtype=drho_type)                       # copper rho_n have dtype=float64
 
-    # helpers
-    last_row_idx = xsize - 1
-
-    # temporary arrays allocated per loop iteration to avoid reallocation inside inner loops
-    # Note: numba doesn't support dynamic 2D allocations inside prange well; we'll allocate modest temporaries here.
     for yfixed in prange(y_max):
-        yfixed_shifted = yfixed + xstart
-
-        # project : shape (xsize, nproj)
-        project = np.empty((xsize, nproj), dtype=rawdat.dtype)
-        for ii in range(xsize):
-            for jj in range(nproj):
-                project[ii, jj] = rawdat[xstart + ii, yfixed_shifted, jj]
-
-        # plnorm (in-place)
-        sum1 = 0.0
-        for jj in range(nproj):
-            sum1 += project[:, 0].sum() if jj == 0 else 0.0
-        # above loop (sum1) written that way to keep typing; compute directly:
-        sum1 = 0.0
-        for ii in range(xsize):
-            sum1 += project[ii, 0]
-
-        for n in range(nproj):
-            sump = 0.0
-            for ii in range(xsize):
-                sump += project[ii, n]
-            if sump != 0.0:
-                scale = sum1 / sump
-                for ii in range(xsize):
-                    project[ii, n] = project[ii, n] * scale
-            else:
-                for ii in range(xsize):
-                    project[ii, n] = 0.0
-
-        # calccos -> proj (nphi, nproj)
-        proj = np.empty((nphi, nproj), dtype=rawdat.dtype)
-        for t in range(nphi):
-            if valid_mask[t]:
-                idx = i_idx[t]
-                dt = deltax[t]
-                for n in range(nproj):
-                    proj[t, n] = project[idx, n] * (1.0 - dt) + project[idx + 1, n] * dt
-            else:
-                # assign edge value
-                for n in range(nproj):
-                    proj[t, n] = project[last_row_idx, n]
-
-        # calcanm: projf = proj @ simul.T  (simul assumed to be the matrix returned by setupprojs)
-        projf = np.empty((nphi, nproj), dtype=rawdat.dtype)
-        for t in range(nphi):
-            for i_col in range(nproj):
-                s = 0.0
-                for j in range(nproj):
-                    s += proj[t, j] * simul[i_col, j]
-                projf[t, i_col] = s
-
-        # compute anm = 0.5 * sininv_mat @ projf (match original calcanm)
-        anm_local = np.empty((nphi, nproj), dtype=rawdat.dtype)
-        for i_row in range(nphi):
-            for j_col in range(nproj):
-                s = 0.0
-                for k in range(nphi):
-                    s += sininv_mat[i_row, k] * projf[k, j_col]
-                anm_local[i_row, j_col] = 0.5 * s
-        # store the final anm (not projf)
-        anm_matrix[yfixed] = anm_local
-
-        # use anm_local for calcrho (avoid reassigning the input 'anm' name)
-        anm_slice = anm_local
-
-        # anm = 0.5 * sininv_mat @ projf
-        # take a 2D view of the passed 3D 'anm' array into a new variable
         anm_slice = anm[yfixed, :, :]
-        # anm = np.empty((nphi, nproj), dtype=rawdat.dtype)
-        # for i_row in range(nphi):
-        #     for j_col in range(nproj):
-        #         s = 0.0
-        #         for k in range(nphi):
-        #             s += sininv_mat[i_row, k] * projf[k, j_col]
-        #         anm[i_row, j_col] = 0.5 * s
-
+        
         # calcrho: loop over projections, build zernike recursion and dot with weights
         # r is (xsize,) radial grid
         for ii in range(nproj):
@@ -780,7 +639,7 @@ def _getrho_anm_core(rawdat, simul, sininv_mat, anm, i_idx, deltax, valid_mask,
                     rhoreturn[rr, ii, yfixed] = 0.0
                 continue
 
-            anm_slice_use = np.empty(cc, dtype=rawdat.dtype)
+            anm_slice_use = np.empty(cc, dtype=drho_type)
             # fill anm_slice_use from anm[start + k, ii]
             for k in range(cc):
                 # val = anm[start + k, ii]
@@ -792,12 +651,12 @@ def _getrho_anm_core(rawdat, simul, sininv_mat, anm, i_idx, deltax, valid_mask,
                     anm_slice_use[k] = val
 
             # compute weights: (2*(m+1)-1 + nn) * anm_slice_use[m]
-            weights = np.empty(cc, dtype=rawdat.dtype)
+            weights = np.empty(cc, dtype=drho_type)
             for m in range(cc):
                 weights[m] = (2.0 * (m + 1) - 1.0 + nn[ii]) * anm_slice_use[m]
 
             # compute zernike recursion for this nn[ii] and cc -> zern (xsize, cc)
-            zern = np.empty((xsize, cc), dtype=rawdat.dtype)
+            zern = np.empty((xsize, cc), dtype=drho_type)
             # first column
             if cc >= 1:
                 if nn[ii] == 0:
@@ -835,219 +694,122 @@ def _getrho_anm_core(rawdat, simul, sininv_mat, anm, i_idx, deltax, valid_mask,
     return rhoreturn
 
 
-def getrho_anm_synth(rawdat, order, pang, nphi, ncoeff, rhofn, anm):
+def getrho_anm_synth(order, ncoeff, rhofn, anm, xsize):
     """
-    Wrapper: precompute matrices and indices in Python (NumPy), then call njit core.
-    """
-    nproj = rawdat.shape[2]         # Should have shape (nsize, nsize, nproj)
-    nsize = rawdat.shape[0]
-    xsize = nsize // 2
-    xstart = nsize // 2
+    Alternate getrho: Use a custom anm matrix to calculate rhoreturn.
 
-    # precompute projection matrix inverse and sin inverse (as full 2D arrays)
-    simul = setupprojs(order, pang, nproj)  # returns (nproj,nproj) matrix (already the inverse)
-    sinmat_flat = setupsin(nphi)            # flattened Fortran-order inverse
-    sininv_mat = sinmat_flat.reshape((nphi, nphi), order='F')
+    Parameters
+    ----------
+    order : int
+        Symmetry order for system (e.g. 4 for C4).
+    ncoeff : int or array-like
+        Number of Zernike coefficients per projection.
+    rhofn : tuple
+        Fermi cutoff parameters (rhocut, flvl, kt).
+    anm : np.ndarray
+        Precomputed anm matrix, shape (xsize, nphi, nproj).
+
+    Returns
+    -------
+    rhoreturn : np.ndarray
+        Calculated rho array, shape (xsize, nproj, xsize).
+    """
+    
+    n_samples, nphi, nproj = anm.shape
 
     # prepare rhofn array (fermi cutoff)
     rhocut, flvl, kt = rhofn[0], rhofn[1], rhofn[2]
     rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
 
-    # precompute calccos indices and interpolation
-    deltaphi = 90.0 / nphi
-    angles = np.linspace(0.0, 90.0, nphi, endpoint=True) * np.pi / 180.0
-    dists = (xsize - 1) * np.cos(angles)
-    i_idx = np.floor(dists).astype(np.int64)
-    deltax = dists - i_idx
-    valid_mask = (i_idx >= 0) & (i_idx < xsize - 1)
-
     # precompute zernike parameters
     r, coeff_count, nn, ni = precompute_zernike(xsize, nproj, order, nphi, ncoeff)
 
     # call compiled core
-    rhoreturn = _getrho_anm_core(rawdat, simul, sininv_mat, anm, i_idx, deltax, valid_mask,
-                             r, coeff_count, nn, ni, rhofn_array, float(order), nphi, int(xstart), int(xsize))
+    rhoreturn = _getrho_anm_core(anm, xsize, r, coeff_count, nn, ni, rhofn_array)
+    
     return rhoreturn
 
 
-def anm_to_rhos(anm, order, pang, rhofn, ncoeff):
-    """
-    Compute rhoreturn directly from ANM coefficients.
+# def anm_to_rhos(anm, order, pang, rhofn, ncoeff):
+#     """
+#     Compute rhoreturn directly from ANM coefficients.
 
-    Parameters
-    ----------
-    anm : ndarray
-        Shape (xsize, nphi, nproj) = (256, 180, 20)
+#     Parameters
+#     ----------
+#     anm : ndarray
+#         Shape (xsize, nphi, nproj) = (256, 180, 20)
 
-    Returns
-    -------
-    rhoreturn : ndarray
-        Reconstructed rho slices
-    """
+#     Returns
+#     -------
+#     rhoreturn : ndarray
+#         Reconstructed rho slices
+#     """
 
-    # infer dimensions from anm
-    xsize, nphi, nproj = anm.shape
-    nsize = 2 * xsize
-    xstart = xsize
+#     # infer dimensions from anm
+#     xsize, nphi, nproj = anm.shape
+#     nsize = 2 * xsize
+#     xstart = xsize
 
-    # --------------------------------------------------
-    # precompute projection matrix inverse
-    # --------------------------------------------------
-    simul = setupprojs(order, pang, nproj)
+#     # --------------------------------------------------
+#     # precompute projection matrix inverse
+#     # --------------------------------------------------
+#     simul = setupprojs(order, pang, nproj)
 
-    # --------------------------------------------------
-    # sin inverse matrix
-    # --------------------------------------------------
-    sinmat_flat = setupsin(nphi)
-    sininv_mat = sinmat_flat.reshape((nphi, nphi), order="F")
+#     # --------------------------------------------------
+#     # sin inverse matrix
+#     # --------------------------------------------------
+#     sinmat_flat = setupsin(nphi)
+#     sininv_mat = sinmat_flat.reshape((nphi, nphi), order="F")
 
-    # --------------------------------------------------
-    # rho cutoff function
-    # --------------------------------------------------
-    rhocut, flvl, kt = rhofn
-    rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
+#     # --------------------------------------------------
+#     # rho cutoff function
+#     # --------------------------------------------------
+#     rhocut, flvl, kt = rhofn
+#     rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
 
-    # --------------------------------------------------
-    # calccos interpolation setup
-    # --------------------------------------------------
-    angles = np.linspace(0.0, 90.0, nphi, endpoint=True) * np.pi / 180.0
-    dists = (xsize - 1) * np.cos(angles)
+#     # --------------------------------------------------
+#     # calccos interpolation setup
+#     # --------------------------------------------------
+#     angles = np.linspace(0.0, 90.0, nphi, endpoint=True) * np.pi / 180.0
+#     dists = (xsize - 1) * np.cos(angles)
 
-    i_idx = np.floor(dists).astype(np.int64)
-    deltax = dists - i_idx
-    valid_mask = (i_idx >= 0) & (i_idx < xsize - 1)
+#     i_idx = np.floor(dists).astype(np.int64)
+#     deltax = dists - i_idx
+#     valid_mask = (i_idx >= 0) & (i_idx < xsize - 1)
 
-    # --------------------------------------------------
-    # zernike precomputation
-    # --------------------------------------------------
-    r, coeff_count, nn, ni = precompute_zernike(
-        xsize, nproj, order, nphi, ncoeff
-    )
+#     # --------------------------------------------------
+#     # zernike precomputation
+#     # --------------------------------------------------
+#     r, coeff_count, nn, ni = precompute_zernike(
+#         xsize, nproj, order, nphi, ncoeff
+#     )
 
-    # --------------------------------------------------
-    # call compiled core
-    # --------------------------------------------------
-    # rawdat is not required for ANM-driven reconstruction
-    rhoreturn = _getrho_anm_core(
-        None,
-        simul,
-        sininv_mat,
-        anm,
-        i_idx,
-        deltax,
-        valid_mask,
-        r,
-        coeff_count,
-        nn,
-        ni,
-        rhofn_array,
-        float(order),
-        nphi,
-        int(xstart),
-        int(xsize),
-    )
+#     # --------------------------------------------------
+#     # call compiled core
+#     # --------------------------------------------------
+#     # rawdat is not required for ANM-driven reconstruction
+#     rhoreturn = _getrho_anm_core(
+#         None,
+#         simul,
+#         sininv_mat,
+#         anm,
+#         i_idx,
+#         deltax,
+#         valid_mask,
+#         r,
+#         coeff_count,
+#         nn,
+#         ni,
+#         rhofn_array,
+#         float(order),
+#         nphi,
+#         int(xstart),
+#         int(xsize),
+#     )
 
-    return rhoreturn
+#     return rhoreturn
 
 ### New anm to rho function: direct from anm to rhos ###
-@njit(parallel=True, fastmath=True)
-def _datagen_anm_to_getrho_(
-    anm,              # (xsize, nphi, nproj)
-    r,                # (xsize,)
-    coeff_count,      # (nproj,)
-    nn,               # (nproj,)
-    ni,               # (nproj,)
-    rhofn_array,      # (xsize,)
-    xsize
-):
-    xsize0, nphi, nproj = anm.shape
-
-    rhoreturn = np.zeros((xsize, nproj, xsize), dtype=anm.dtype)
-
-    for yfixed in prange(xsize):
-        anm_slice = anm[yfixed]  # (nphi, nproj)
-
-        for ii in range(nproj):
-            cc = coeff_count[ii]
-            if cc == 0:
-                continue
-
-            start = ni[ii]
-
-            # build filtered ANM slice
-            anm_use = np.empty(cc, dtype=anm.dtype)
-            for k in range(cc):
-                val = anm_slice[start + k, ii]
-                if nn[ii] > 0 and k < (nn[ii] // 2):
-                    anm_use[k] = 0.0
-                else:
-                    anm_use[k] = val
-
-            # weights
-            weights = np.empty(cc, dtype=anm.dtype)
-            for m in range(cc):
-                weights[m] = (2.0 * (m + 1) - 1.0 + nn[ii]) * anm_use[m]
-
-            # Zernike recursion
-            zern = np.empty((xsize, cc), dtype=anm.dtype)
-
-            if nn[ii] == 0:
-                for rr in range(xsize):
-                    zern[rr, 0] = 1.0
-            else:
-                for rr in range(xsize):
-                    zern[rr, 0] = r[rr] ** nn[ii]
-
-            if cc > 1:
-                for rr in range(xsize):
-                    zern[rr, 1] = zern[rr, 0] * (
-                        (nn[ii] + 2.0) * (r[rr] ** 2) - (nn[ii] + 1.0)
-                    )
-
-            for l in range(2, cc):
-                m = l - 1
-                m2 = nn[ii] + 2 * m
-                m1 = m2 + 2
-                denom = l * m2 * (nn[ii] + l)
-
-                for rr in range(xsize):
-                    num = (
-                        (nn[ii] + l + m)
-                        * (m2 * (m1 * (r[rr] ** 2) - nn[ii] - 1.0) - 2.0 * m * m)
-                        * zern[rr, l - 1]
-                        - m * (nn[ii] + m) * m1 * zern[rr, l - 2]
-                    )
-                    zern[rr, l] = num / denom
-
-            # dot product
-            for rr in range(xsize):
-                s = 0.0
-                for m in range(cc):
-                    s += zern[rr, m] * weights[m]
-                rhoreturn[rr, ii, yfixed] = s * rhofn_array[rr]
-
-    return rhoreturn
-
-
-def anm_to_rhos(anm, order, rhofn, ncoeff):
-    xsize, nphi, nproj = anm.shape
-
-    rhocut, flvl, kt = rhofn
-    rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
-
-    r, coeff_count, nn, ni = precompute_zernike(
-        xsize, nproj, order, nphi, ncoeff
-    )
-
-    return _datagen_anm_to_getrho_(
-        anm,
-        r,
-        coeff_count,
-        nn,
-        ni,
-        rhofn_array,
-        xsize
-    )
 
 
 #################################################### Data Generation: HYPER! ####################################################
@@ -1243,7 +1005,7 @@ def standardize_anm(anm):
 
 def unstandardize_anm(anm_pca, means, stds):
     """
-    Reverse the standardization of the anm matrix, restoring original mean and standard deviation.
+    Reverse the standardization of the anm matrix, restoring original mean and standard deviation to that of the central slice
 
     Parameters
     ----------
@@ -1263,7 +1025,7 @@ def unstandardize_anm(anm_pca, means, stds):
     anm_original = np.zeros_like(anm_pca)
     for j in range(xsize):
         for i in range(nproj):
-            anm_original[j][:, i] = anm_pca[j][:, i] * stds[j, i] + means[j, i]
+            anm_original[j][:, i] = anm_pca[j][:, i] * stds[0, i] + means[0, i]
     return anm_original
 
 
@@ -1322,6 +1084,119 @@ def custom_randint():
         # np.arange(180, 210)
     ])
     return np.random.choice(allowed)
+
+
+
+
+### DMD Algorithm Functions ###
+# For Rho functions time evolution (adapted for shape (256, 180, 20))
+# --------------------------------------------------
+# 1. Prepare data
+# --------------------------------------------------
+
+def prepare_snapshots(data):
+    """
+    data: array of shape (256, 180, 20)
+    returns X, Y with shape (180*20, T-1)
+    """
+    T = data.shape[0]  # Now T = 256 (time/slice axis)
+    snapshots = [data[t, :, :].reshape(-1) for t in range(T)]
+    snapshots = np.stack(snapshots, axis=1)
+    X = snapshots[:, :-1]
+    Y = snapshots[:, 1:]
+    return X, Y
+
+# --------------------------------------------------
+# 2. PCA (SVD-based)
+# --------------------------------------------------
+
+def compute_pca(X, rank):
+    """
+    X: (n_features, n_samples)
+    """
+    X_mean = np.mean(X, axis=1, keepdims=True)
+    Xc = X - X_mean
+
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    U_k = U[:, :rank]
+    return U_k, X_mean
+
+# --------------------------------------------------
+# 3. Koopman / DMD operator in latent space
+# --------------------------------------------------
+
+def compute_koopman(X, Y, U_k):
+    """
+    Learns A such that z_{t+1} = A z_t
+    """
+    Z = U_k.T @ X
+    Zp = U_k.T @ Y
+
+    A = Zp @ np.linalg.pinv(Z)
+    return A
+
+# --------------------------------------------------
+# 4. Train model
+# --------------------------------------------------
+
+def train_pca_dmd_per_channel(data, latent_dim=20):
+    """
+    Trains a separate PCA/DMD model for each channel.
+    data: array of shape (256, 180, 20)
+    Returns: list of models, one per channel
+    """
+    n_channels = data.shape[2]
+    models = []
+    for ch in range(n_channels):
+        # For each channel, extract (256, 180) array
+        channel_data = data[:, :, ch]  # shape (256, 180)
+        # Each time step is a (180,) vector, so stack as (180, 256)
+        # But we want to treat each time step as a (180, 1) snapshot, so flatten to (180, 1)
+        # Actually, for PCA, we want (180, T) where T=256
+        X = channel_data.T  # shape (180, 256)
+        X_mean = np.mean(X, axis=1, keepdims=True)
+        Xc = X - X_mean
+        U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+        U_k = U[:, :latent_dim]
+        # Prepare X, Y for Koopman
+        X_snap = X[:, :-1]
+        Y_snap = X[:, 1:]
+        Z = U_k.T @ (X_snap - X_mean)
+        Zp = U_k.T @ (Y_snap - X_mean)
+        A = Zp @ np.linalg.pinv(Z)
+        models.append({
+            "U_k": U_k,
+            "A": A,
+            "mean": X_mean
+        })
+    return models
+
+
+# --------------------------------------------------
+# 5. Rollout from new initial condition
+# --------------------------------------------------
+
+def rollout_per_channel(models, x0, n_steps):
+    """
+    Rollout for each channel separately.
+    x0: shape (180, 20) -- initial condition at a moment in time
+    Returns: (n_steps, 180, 20) -- predicted evolution for all channels
+    """
+    n_channels = x0.shape[1]
+    n_space = x0.shape[0]
+    all_channels = np.zeros((n_steps, n_space, n_channels))
+    for ch in range(n_channels):
+        model = models[ch]
+        U_k = model["U_k"]
+        A = model["A"]
+        mean = model["mean"]
+        x = x0[:, ch].reshape(-1, 1)  # shape (180, 1)
+        z = U_k.T @ (x - mean)
+        for t in range(n_steps):
+            x_rec = (U_k @ z + mean).reshape(n_space)
+            all_channels[t, :, ch] = x_rec
+            z = A @ z
+    return all_channels  # shape (n_steps, 180, 20)
 
 
 
