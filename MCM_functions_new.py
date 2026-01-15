@@ -1,42 +1,24 @@
 import numpy as np
 import math
 import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# import tomosipo as ts
-# from numpy.polynomial.chebyshev import chebvander
-# from numpy.polynomial.chebyshev import chebvander2d
-# import torch.fft
-# import astra
 from tqdm import tqdm
-# from skimage.transform import radon, resize
-# from scipy.special import eval_jacobi
 from scipy.linalg import lstsq
-from scipy.ndimage import rotate, convolve, gaussian_filter1d, gaussian_filter
+from scipy.ndimage import rotate, convolve, gaussian_filter1d, gaussian_filter, zoom
 from scipy.optimize import curve_fit
 from symfit import parameters, variables, sin, cos, Fit
-# from scipy.ndimage import map_coordinates
 import numba
 from numba import njit, prange
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.animation as animation
-#from mpl_toolkits.mplot3d import Axes3D
-# from matplotlib import cm
 from matplotlib.animation import PillowWriter
-
 import random
 import os
 import re
-# import plotly.graph_objects as go
-# import matplotlib.path as mpath
-# from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.signal import fftconvolve
 import glob
-
 from IPython.display import display, clear_output, HTML
-# from ipywidgets import interact, IntSlider
-# import ipywidgets as widgets
+from sklearn.decomposition import PCA
 
 
 
@@ -888,6 +870,462 @@ def getrho_anm_synth(rawdat, order, pang, nphi, ncoeff, rhofn, anm):
     return rhoreturn
 
 
+def anm_to_rhos(anm, order, pang, rhofn, ncoeff):
+    """
+    Compute rhoreturn directly from ANM coefficients.
+
+    Parameters
+    ----------
+    anm : ndarray
+        Shape (xsize, nphi, nproj) = (256, 180, 20)
+
+    Returns
+    -------
+    rhoreturn : ndarray
+        Reconstructed rho slices
+    """
+
+    # infer dimensions from anm
+    xsize, nphi, nproj = anm.shape
+    nsize = 2 * xsize
+    xstart = xsize
+
+    # --------------------------------------------------
+    # precompute projection matrix inverse
+    # --------------------------------------------------
+    simul = setupprojs(order, pang, nproj)
+
+    # --------------------------------------------------
+    # sin inverse matrix
+    # --------------------------------------------------
+    sinmat_flat = setupsin(nphi)
+    sininv_mat = sinmat_flat.reshape((nphi, nphi), order="F")
+
+    # --------------------------------------------------
+    # rho cutoff function
+    # --------------------------------------------------
+    rhocut, flvl, kt = rhofn
+    rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
+
+    # --------------------------------------------------
+    # calccos interpolation setup
+    # --------------------------------------------------
+    angles = np.linspace(0.0, 90.0, nphi, endpoint=True) * np.pi / 180.0
+    dists = (xsize - 1) * np.cos(angles)
+
+    i_idx = np.floor(dists).astype(np.int64)
+    deltax = dists - i_idx
+    valid_mask = (i_idx >= 0) & (i_idx < xsize - 1)
+
+    # --------------------------------------------------
+    # zernike precomputation
+    # --------------------------------------------------
+    r, coeff_count, nn, ni = precompute_zernike(
+        xsize, nproj, order, nphi, ncoeff
+    )
+
+    # --------------------------------------------------
+    # call compiled core
+    # --------------------------------------------------
+    # rawdat is not required for ANM-driven reconstruction
+    rhoreturn = _getrho_anm_core(
+        None,
+        simul,
+        sininv_mat,
+        anm,
+        i_idx,
+        deltax,
+        valid_mask,
+        r,
+        coeff_count,
+        nn,
+        ni,
+        rhofn_array,
+        float(order),
+        nphi,
+        int(xstart),
+        int(xsize),
+    )
+
+    return rhoreturn
+
+### New anm to rho function: direct from anm to rhos ###
+@njit(parallel=True, fastmath=True)
+def _datagen_anm_to_getrho_(
+    anm,              # (xsize, nphi, nproj)
+    r,                # (xsize,)
+    coeff_count,      # (nproj,)
+    nn,               # (nproj,)
+    ni,               # (nproj,)
+    rhofn_array,      # (xsize,)
+    xsize
+):
+    xsize0, nphi, nproj = anm.shape
+
+    rhoreturn = np.zeros((xsize, nproj, xsize), dtype=anm.dtype)
+
+    for yfixed in prange(xsize):
+        anm_slice = anm[yfixed]  # (nphi, nproj)
+
+        for ii in range(nproj):
+            cc = coeff_count[ii]
+            if cc == 0:
+                continue
+
+            start = ni[ii]
+
+            # build filtered ANM slice
+            anm_use = np.empty(cc, dtype=anm.dtype)
+            for k in range(cc):
+                val = anm_slice[start + k, ii]
+                if nn[ii] > 0 and k < (nn[ii] // 2):
+                    anm_use[k] = 0.0
+                else:
+                    anm_use[k] = val
+
+            # weights
+            weights = np.empty(cc, dtype=anm.dtype)
+            for m in range(cc):
+                weights[m] = (2.0 * (m + 1) - 1.0 + nn[ii]) * anm_use[m]
+
+            # Zernike recursion
+            zern = np.empty((xsize, cc), dtype=anm.dtype)
+
+            if nn[ii] == 0:
+                for rr in range(xsize):
+                    zern[rr, 0] = 1.0
+            else:
+                for rr in range(xsize):
+                    zern[rr, 0] = r[rr] ** nn[ii]
+
+            if cc > 1:
+                for rr in range(xsize):
+                    zern[rr, 1] = zern[rr, 0] * (
+                        (nn[ii] + 2.0) * (r[rr] ** 2) - (nn[ii] + 1.0)
+                    )
+
+            for l in range(2, cc):
+                m = l - 1
+                m2 = nn[ii] + 2 * m
+                m1 = m2 + 2
+                denom = l * m2 * (nn[ii] + l)
+
+                for rr in range(xsize):
+                    num = (
+                        (nn[ii] + l + m)
+                        * (m2 * (m1 * (r[rr] ** 2) - nn[ii] - 1.0) - 2.0 * m * m)
+                        * zern[rr, l - 1]
+                        - m * (nn[ii] + m) * m1 * zern[rr, l - 2]
+                    )
+                    zern[rr, l] = num / denom
+
+            # dot product
+            for rr in range(xsize):
+                s = 0.0
+                for m in range(cc):
+                    s += zern[rr, m] * weights[m]
+                rhoreturn[rr, ii, yfixed] = s * rhofn_array[rr]
+
+    return rhoreturn
+
+
+def anm_to_rhos(anm, order, rhofn, ncoeff):
+    xsize, nphi, nproj = anm.shape
+
+    rhocut, flvl, kt = rhofn
+    rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
+
+    r, coeff_count, nn, ni = precompute_zernike(
+        xsize, nproj, order, nphi, ncoeff
+    )
+
+    return _datagen_anm_to_getrho_(
+        anm,
+        r,
+        coeff_count,
+        nn,
+        ni,
+        rhofn_array,
+        xsize
+    )
+
+
+#################################################### Data Generation: HYPER! ####################################################
+
+@njit(parallel=True, fastmath=True)
+def _datagen_anm_to_getrho_(
+    anm,              # (xsize, nphi, nproj)
+    r,                # (xsize,)
+    coeff_count,      # (nproj,)
+    nn,               # (nproj,)
+    ni,               # (nproj,)
+    rhofn_array,      # (xsize,)
+    xsize
+):
+    xsize0, nphi, nproj = anm.shape
+
+    rhoreturn = np.zeros((xsize, nproj, xsize), dtype=anm.dtype)
+
+    for yfixed in prange(xsize):
+        anm_slice = anm[yfixed]  # (nphi, nproj)
+
+        for ii in range(nproj):
+            cc = coeff_count[ii]
+            if cc == 0:
+                continue
+
+            start = ni[ii]
+
+            # build filtered ANM slice
+            anm_use = np.empty(cc, dtype=anm.dtype)
+            for k in range(cc):
+                val = anm_slice[start + k, ii]
+                if nn[ii] > 0 and k < (nn[ii] // 2):
+                    anm_use[k] = 0.0
+                else:
+                    anm_use[k] = val
+
+            # weights
+            weights = np.empty(cc, dtype=anm.dtype)
+            for m in range(cc):
+                weights[m] = (2.0 * (m + 1) - 1.0 + nn[ii]) * anm_use[m]
+
+            # Zernike recursion
+            zern = np.empty((xsize, cc), dtype=anm.dtype)
+
+            if nn[ii] == 0:
+                for rr in range(xsize):
+                    zern[rr, 0] = 1.0
+            else:
+                for rr in range(xsize):
+                    zern[rr, 0] = r[rr] ** nn[ii]
+
+            if cc > 1:
+                for rr in range(xsize):
+                    zern[rr, 1] = zern[rr, 0] * (
+                        (nn[ii] + 2.0) * (r[rr] ** 2) - (nn[ii] + 1.0)
+                    )
+
+            for l in range(2, cc):
+                m = l - 1
+                m2 = nn[ii] + 2 * m
+                m1 = m2 + 2
+                denom = l * m2 * (nn[ii] + l)
+
+                for rr in range(xsize):
+                    num = (
+                        (nn[ii] + l + m)
+                        * (m2 * (m1 * (r[rr] ** 2) - nn[ii] - 1.0) - 2.0 * m * m)
+                        * zern[rr, l - 1]
+                        - m * (nn[ii] + m) * m1 * zern[rr, l - 2]
+                    )
+                    zern[rr, l] = num / denom
+
+            # dot product
+            for rr in range(xsize):
+                s = 0.0
+                for m in range(cc):
+                    s += zern[rr, m] * weights[m]
+                rhoreturn[rr, ii, yfixed] = s * rhofn_array[rr]
+
+    return rhoreturn
+
+def anm_to_rhos(anm, order, rhofn, ncoeff):
+    xsize, nphi, nproj = anm.shape
+
+    rhocut, flvl, kt = rhofn
+    rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
+
+    r, coeff_count, nn, ni = precompute_zernike(
+        xsize, nproj, order, nphi, ncoeff
+    )
+
+    return _datagen_anm_to_getrho_(
+        anm,
+        r,
+        coeff_count,
+        nn,
+        ni,
+        rhofn_array,
+        xsize
+    )
+
+
+
+
+#################################################### 3D TPMD Generation ####################################################
+
+def animate_slices(volume,
+                   start_frame=0,
+                   end_frame=None,
+                   fixed_z=None,
+                   output_filename="Cormack_reconstructed_xz.gif",
+                   fps=10,
+                   interval=100,
+                   cmap='hot',
+                   vmin=None,
+                   vmax=None,
+                   save=None):
+    """
+    Animate x–y slices (varying z-index) from a 3D Cormack reconstruction volume.
+    """
+    N = volume.shape[0]
+    if end_frame is None or end_frame >= N:
+        end_frame = N - 1
+    if fixed_z is not None:
+        start_frame = end_frame = fixed_z
+    frames_to_animate = range(start_frame, end_frame + 1)
+
+    # Use provided vmin/vmax or compute from the whole volume
+    if vmin is None:
+        vmin = np.quantile(volume, 0.01)
+    if vmax is None:
+        vmax = np.quantile(volume, 1.0)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    initial_slice = volume[:, start_frame, :].T
+    img = ax.imshow(initial_slice, cmap=cmap, origin='lower',
+                    vmin=vmin, vmax=vmax, aspect='auto')
+    cbar = fig.colorbar(img, ax=ax, shrink=0.8)
+    cbar.set_label("Reconstructed Intensity")
+    title = ax.set_title(f"Reconstructed XZ Slice (y = {start_frame:03d})")
+    ax.set_xlabel("X-axis (Px)")
+    ax.set_ylabel("Z-axis (Pz)")
+
+    def update(frame):
+        img.set_array(volume[:, frame, :].T)
+        title.set_text(f"Reconstructed XZ Slice (y = {frame:03d})")
+        return img, title
+
+    anim = animation.FuncAnimation(fig, update, frames=frames_to_animate,
+                                   interval=interval, blit=False)
+    if save == True:
+        anim.save("MCM_Cu.gif", writer='pillow', fps=10)
+    plt.close(fig)
+    return HTML(anim.to_jshtml())
+
+
+
+def standardize_anm(anm):
+    """
+    Standardize the anm matrix so that for each j and i, anm[j][:, i] has mean 0 and std 1.
+
+    Parameters
+    ----------
+    anm : np.ndarray
+        Input array of shape (xsize, nphi, nproj).
+
+    Returns
+    -------
+    anm_pca : np.ndarray
+        Standardized array of the same shape as anm.
+    means : np.ndarray
+        Means for each (j, i), shape (xsize, nproj).
+    stds : np.ndarray
+        Standard deviations for each (j, i), shape (xsize, nproj).
+    """
+    xsize, nphi, nproj = anm.shape
+    anm_pca = np.zeros_like(anm)
+    means = np.zeros((xsize, nproj))
+    stds = np.zeros((xsize, nproj))
+    for j in range(xsize):
+        for i in range(nproj):
+            vec = anm[j][:, i]
+            mean = np.mean(vec)
+            std = np.std(vec)
+            means[j, i] = mean
+            stds[j, i] = std
+            if std > 0:
+                anm_pca[j][:, i] = (vec - mean) / std
+            else:
+                anm_pca[j][:, i] = 0.0
+    return anm_pca, means, stds
+
+def unstandardize_anm(anm_pca, means, stds):
+    """
+    Reverse the standardization of the anm matrix, restoring original mean and standard deviation.
+
+    Parameters
+    ----------
+    anm_pca : np.ndarray
+        Standardized array of shape (xsize, nphi, nproj).
+    means : np.ndarray
+        Array of means used for standardization, shape (xsize, nproj).
+    stds : np.ndarray
+        Array of standard deviations used for standardization, shape (xsize, nproj).
+
+    Returns
+    -------
+    anm_original : np.ndarray
+        Array restored to original mean and standard deviation, same shape as anm_pca.
+    """
+    xsize, nphi, nproj = anm_pca.shape
+    anm_original = np.zeros_like(anm_pca)
+    for j in range(xsize):
+        for i in range(nproj):
+            anm_original[j][:, i] = anm_pca[j][:, i] * stds[j, i] + means[j, i]
+    return anm_original
+
+
+
+def pca_over_j(anm_pca, i):
+    """
+    Apply PCA to the dataset formed by stacking anm_pca[j][:, i] for all j.
+
+    Parameters
+    ----------
+    anm_pca : np.ndarray
+        Standardized anm array of shape (xsize, nphi, nproj).
+    i : int
+        Projection index to fix.
+
+    Returns
+    -------
+    principal_components : np.ndarray
+        Principal components, shape (xsize, nphi).
+    explained_variance : np.ndarray
+        Explained variance ratio for each principal component.
+    """
+    xsize, nphi, nproj = anm_pca.shape
+
+    # Stack anm_pca[j][:, i] for all j into a matrix of shape (xsize, nphi)
+    data_matrix = np.array([anm_pca[j][:, i] for j in range(xsize)])  # shape: (xsize, nphi)
+
+    # Apply PCA
+    pca = PCA()
+    principal_components = pca.fit_transform(data_matrix)  # shape: (xsize, nphi)
+    explained_variance = pca.explained_variance_ratio_
+
+    return principal_components, explained_variance
+
+
+
+def normalize_rhoreturn_ideal_Cu(rhoreturn_ideal_Cu):
+    """
+    Normalizes rhoreturn_ideal_Cu[:, 0:20, slice_idx] for each slice_idx by the max of rhoreturn_ideal_Cu[:, 0, slice_idx].
+    Returns the normalized array and the array of max values for each slice_idx.
+    """
+    normalized = np.copy(rhoreturn_ideal_Cu)
+    max_vals = np.zeros(rhoreturn_ideal_Cu.shape[2])
+    for slice_idx in range(rhoreturn_ideal_Cu.shape[2]):
+        max_val = np.max(rhoreturn_ideal_Cu[:, 0, slice_idx])
+        max_vals[slice_idx] = max_val
+        normalized[:, 0:20, slice_idx] /= max_val if max_val != 0 else 1.0
+    return normalized, max_vals
+
+
+def custom_randint():
+    # Allowed ranges: 0-30, 60-119, 180-209
+    allowed = np.concatenate([
+        np.arange(0, 35),
+        np.arange(60, 133),
+        # np.arange(180, 210)
+    ])
+    return np.random.choice(allowed)
+
+
+
+
 
 #################################################### Non-MCM functions ####################################################
 
@@ -1015,10 +1453,7 @@ def animate_slices_normalized(volume,
     HTML
         HTML animation for Jupyter display.
     """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from matplotlib import animation
-    from IPython.display import HTML
+    
 
     N = volume.shape[0]
     if end_frame is None or end_frame >= N:
@@ -1476,7 +1911,6 @@ def MSF_convolution(c_simulated, grid_size=(512, 512)):
     
     # Resize to specified grid size if different from current size
     if msf_result.shape != grid_size:
-        from scipy.ndimage import zoom
         zoom_factors = (grid_size[0] / msf_result.shape[0], 
                        grid_size[1] / msf_result.shape[1])
         msf_result = zoom(msf_result, zoom_factors, order=1)
