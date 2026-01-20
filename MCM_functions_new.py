@@ -269,9 +269,9 @@ def rhocutoff(xsize, rhocut, flvl, kt):
 def _getrho_core(rawdat, simul, sininv_mat, i_idx, deltax, valid_mask,
                  r, coeff_count, nn, ni, rhofn_array, order, nphi, xstart, xsize):
     nproj = rawdat.shape[2]
+    y_max = rawdat.shape[1]
     N = xsize
-    # ensure y_max equals xsize
-    y_max = xsize
+    
     rhoreturn = np.zeros((xsize, nproj, xsize), dtype=rawdat.dtype)
     anm_matrix = np.zeros((xsize, nphi, nproj), dtype=rawdat.dtype)
 
@@ -1200,6 +1200,46 @@ def rollout_per_channel(models, x0, n_steps):
     return all_channels  # shape (n_steps, 180, 20)
 
 
+# Taking projections of generated TPMD Central Slices
+def compute_projections_stacked(TPMD_Slices, angles_to_extract=np.linspace(0, 45, 20, endpoint=True)):
+    """
+    For each sample in TPMD_Slices, computes the Radon transform,
+    extracts projections at specified angles, and computes anm_arr.
+    Returns anm_arr_stacked of shape (n_samples, anm_arr.shape[0], anm_arr.shape[1]).
+    
+    Parameters:
+    - TPMD_Slices: np.ndarray, shape (512, n_samples, 512)
+    - order, calib, nphi, ncoeffs, rhofn, sinmat: parameters for getrho_1d
+    - angles_to_extract: list or np.ndarray of angles to extract projections
+    
+    Returns:
+    - anm_arr_stacked: np.ndarray, shape (n_samples, anm_arr.shape[0], anm_arr.shape[1])
+    """
+    n_samples = TPMD_Slices.shape[1]
+    # theta = np.linspace(0., 180., Synthetic_Central_Slices.shape[0], endpoint=False)
+    # angle_indices = [np.argmin(np.abs(theta - angle)) for angle in angles_to_extract]
+    nproj = len(angles_to_extract)
+    projections = np.zeros((TPMD_Slices.shape[0], n_samples, nproj))
+    
+    for i in tqdm(range(n_samples), desc="Computing anm_arr for samples"):
+        xz_slice = TPMD_Slices[:, i, :]  # Shape (512, 512)
+        sinogram = radon(xz_slice, theta=angles_to_extract, circle=True)
+        projections[:, i, :] = sinogram                        #[:, angle_indices]  # Shape (512, nproj)
+    return projections
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1562,9 +1602,12 @@ def apply_detector_resolution3D(vol, N=512, fwhm_x_au=0.11, fwhm_y_au=0.137, fwh
     sigma_z = fwhm_z_au / 2.355
 
     # Calculate pixel size in each direction
-    pixel_size_x = 6.87 / N
-    pixel_size_y = 6.87 / N
-    pixel_size_z = 6.87 / N
+    # pixel_size_x = 6.87 / N
+    # pixel_size_y = 6.87 / N
+    # pixel_size_z = 6.87 / N
+    pixel_size_x = 5.0 / N
+    pixel_size_y = 5.0 / N
+    pixel_size_z = 5.0 / N
 
     # Sigma in pixels
     sigma_x_pix = sigma_x / pixel_size_x
@@ -1590,8 +1633,10 @@ def apply_detector_resolution(img, N=512, fwhm_x_au=0.11, fwhm_y_au=0.137):
     sigma_y = fwhm_y_au / 2.355
 
     # Calculate pixel size in each direction (expected images are 10x10 atomic units)
-    pixel_size_x = 6.87 / N
-    pixel_size_y = 6.87 / N
+    # pixel_size_x = 6.87 / N
+    # pixel_size_y = 6.87 / N
+    pixel_size_x = 5.0 / N
+    pixel_size_y = 5.0 / N
 
     # Sigma in pixels
     sigma_x_pix = sigma_x / pixel_size_x
@@ -1797,13 +1842,14 @@ def MSF_convolution(c_simulated, grid_size=(512, 512)):
     return msf_result
 
 
-def apply_elliptical_gaussian(img, sigma_x, sigma_y, projection_size_au=6.87, N=512):
+def apply_elliptical_gaussian(img, sigma_x, sigma_y, projection_size_au=5.0, N=512):
     """
     img: 2D numpy array (128x128)
     sigma_x, sigma_y: FWHM in physical units (e.g., x=0.11, y=0.137 au for ACAR)
     field_of_view: total width/height in physical units (default 10)
     N: number of pixels (default 128)
     """
+    #### projection_size_au=6.87 for ZrZn2 Data
     pixel_size = projection_size_au / N         # units per pixel
     sigma_x_pix = sigma_x / 2.355 / pixel_size
     sigma_y_pix = sigma_y / 2.355 / pixel_size
@@ -1879,7 +1925,7 @@ def symmetrize_4fold_even(image):
 
 #total_counts = 2_000_000  # Total counts for each projection, can be adjusted as needed
 
-def make_realistic_projections(raw_projs, sigma_x=0.11, sigma_y=0.137, projection_size_au=6.87, total_counts=0, four_sym=None):
+def make_realistic_projections(raw_projs, sigma_x=0.11, sigma_y=0.137, projection_size_au=5.0, total_counts=0, four_sym=None):
     """
     raw_projs: shape (N, N, nproj)
     Returns: processed_projs (N, N, nproj)
@@ -1890,6 +1936,7 @@ def make_realistic_projections(raw_projs, sigma_x=0.11, sigma_y=0.137, projectio
     sigma * 2.354 = FWHM, so FWHM ≈ 0.137au, then just make sure to convert this back into
     channels (gotta know the units): 0.137/0.0775, and for the sigma we have 2.355
     """
+    #### projection_size_au=6.87 for ZrZn2 Data
     N, _, nproj = raw_projs.shape
     processed = np.zeros_like(raw_projs)
     msf_stack = []
