@@ -244,8 +244,8 @@ for i in tqdm(range(1), desc="Generating Projections, Rhos, and TPMD datasets"):
     predicted = rollout_per_channel(model, anm_arr[i], n_steps=256)
     rhos_evolved = anm_to_rhos(predicted, order, rhofn, ncoeffs)
 
-    print(predicted.shape)
-    print(rhos_evolved.shape)
+    # print(predicted.shape)
+    # print(rhos_evolved.shape)
 
     Rand_vol_evolved = calcplane(rhos_evolved, rhos_evolved.shape[2], order)
 
@@ -283,24 +283,34 @@ for i in tqdm(range(1), desc="Generating Projections, Rhos, and TPMD datasets"):
     """ --- Saving the Projection Data --- """
     # Indices to extract (rounded to nearest integer)
     centre = full_synth_tpmd_projections.shape[1] // 2
-    y_indices = np.round(np.linspace(centre, centre + 100, 10)).astype(int)
+    y_indices = np.round(np.arange(centre, centre + 100, 10)).astype(int)
+    
+    save_ideal_proj = full_synth_tpmd_projections[:, y_indices, :]
+    save_meas_proj = realistic_projs[:, y_indices, :]
+    
+    
+    
 
     save_path_ideal = os.path.join(proj_ideal_dir, f"proj_ideal_{i}.txt")
-    np.savetxt(save_path_ideal, full_synth_tpmd_projections[:, y_indices, :].flatten())
+    np.savetxt(save_path_ideal, save_ideal_proj.flatten())
 
     save_path_meas = os.path.join(proj_meas_dir, f"proj_meas_{i}.txt")
-    np.savetxt(save_path_meas, realistic_projs[:, y_indices, :].flatten())
+    np.savetxt(save_path_meas, save_meas_proj.flatten())
+    
+    # print(save_meas_proj.shape)
     
     
     """ --- Saving the 3D Rho Data --- """
-    reconstruction_ideal, _ = getrho(full_synth_tpmd_projections[:, y_indices, :], order, pang, nphi, 20 * [120], rhofn_PCA)
-    reconstruction_measure, _ = getrho(realistic_projs[:, y_indices, :], order, pang_measure, nphi, 5 * [120], rhofn_PCA)
+    reconstruction_ideal, _ = getrho_training_data(save_ideal_proj, order, pang, nphi, 20 * [120], rhofn_PCA)
+    reconstruction_measure, _ = getrho_training_data(save_meas_proj, order, pang_measure, nphi, 5 * [120], rhofn_PCA)
     
     save_path_ideal = os.path.join(rho_ideal_dir, f"rho_ideal_{i}.txt")
     np.savetxt(save_path_ideal, reconstruction_ideal.flatten())
 
     save_path_meas = os.path.join(rho_meas_dir, f"rho_meas_{i}.txt")
     np.savetxt(save_path_meas, reconstruction_measure.flatten())
+    
+    # print(reconstruction_ideal.shape)
 
 
     """ --- Saving the 3D TPMD Data --- """
