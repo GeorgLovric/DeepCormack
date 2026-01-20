@@ -269,8 +269,9 @@ def rhocutoff(xsize, rhocut, flvl, kt):
 def _getrho_core(rawdat, simul, sininv_mat, i_idx, deltax, valid_mask,
                  r, coeff_count, nn, ni, rhofn_array, order, nphi, xstart, xsize):
     nproj = rawdat.shape[2]
-    y_max = rawdat.shape[1]
+    # y_max = rawdat.shape[1]
     N = xsize
+    y_max = xsize
     
     rhoreturn = np.zeros((xsize, nproj, xsize), dtype=rawdat.dtype)
     anm_matrix = np.zeros((xsize, nphi, nproj), dtype=rawdat.dtype)
@@ -342,14 +343,14 @@ def _getrho_core(rawdat, simul, sininv_mat, i_idx, deltax, valid_mask,
         # store the final anm (not projf) so output matches original getrho
         anm_matrix[yfixed] = anm
 
-        # anm = 0.5 * sininv_mat @ projf
-        anm = np.empty((nphi, nproj), dtype=rawdat.dtype)
-        for i_row in range(nphi):
-            for j_col in range(nproj):
-                s = 0.0
-                for k in range(nphi):
-                    s += sininv_mat[i_row, k] * projf[k, j_col]
-                anm[i_row, j_col] = 0.5 * s
+        # # anm = 0.5 * sininv_mat @ projf
+        # anm = np.empty((nphi, nproj), dtype=rawdat.dtype)
+        # for i_row in range(nphi):
+        #     for j_col in range(nproj):
+        #         s = 0.0
+        #         for k in range(nphi):
+        #             s += sininv_mat[i_row, k] * projf[k, j_col]
+        #         anm[i_row, j_col] = 0.5 * s
 
         # calcrho: loop over projections, build zernike recursion and dot with weights
         # r is (xsize,) radial grid
@@ -1230,7 +1231,202 @@ def compute_projections_stacked(TPMD_Slices, angles_to_extract=np.linspace(0, 45
 
 
 
+### Modified numba getrho function to be able to synthesize large amounts of central slices stacked together ###
 
+@njit(parallel=True, fastmath=True)
+def _training_getrho_core(rawdat, simul, sininv_mat, i_idx, deltax, valid_mask,
+                 r, coeff_count, nn, ni, rhofn_array, order, nphi, xstart, xsize):
+    nproj = rawdat.shape[2]
+    y_max = rawdat.shape[1]
+    N = xsize
+    # ensure y_max equals xsize
+    
+    rhoreturn = np.zeros((xsize, nproj, y_max), dtype=rawdat.dtype)
+    anm_matrix = np.zeros((y_max, nphi, nproj), dtype=rawdat.dtype)
+
+    # helpers
+    last_row_idx = xsize - 1
+
+    # temporary arrays allocated per loop iteration to avoid reallocation inside inner loops
+    # Note: numba doesn't support dynamic 2D allocations inside prange well; we'll allocate modest temporaries here.
+    for yfixed in prange(y_max):
+        # yfixed_shifted = yfixed + xstart
+
+        # project : shape (xsize, nproj)
+        project = np.empty((xsize, nproj), dtype=rawdat.dtype)
+        for ii in range(xsize):
+            for jj in range(nproj):
+                # project[ii, jj] = rawdat[xstart + ii, yfixed_shifted, jj]
+                project[ii, jj] = rawdat[xstart + ii, yfixed, jj]
+
+        # plnorm (in-place)
+        sum1 = 0.0
+        for jj in range(nproj):
+            sum1 += project[:, 0].sum() if jj == 0 else 0.0
+        # above loop (sum1) written that way to keep typing; compute directly:
+        sum1 = 0.0
+        for ii in range(xsize):
+            sum1 += project[ii, 0]
+
+        for n in range(nproj):
+            sump = 0.0
+            for ii in range(xsize):
+                sump += project[ii, n]
+            if sump != 0.0:
+                scale = sum1 / sump
+                for ii in range(xsize):
+                    project[ii, n] = project[ii, n] * scale
+            else:
+                for ii in range(xsize):
+                    project[ii, n] = 0.0
+
+        # calccos -> proj (nphi, nproj)
+        proj = np.empty((nphi, nproj), dtype=rawdat.dtype)
+        for t in range(nphi):
+            if valid_mask[t]:
+                idx = i_idx[t]
+                dt = deltax[t]
+                for n in range(nproj):
+                    proj[t, n] = project[idx, n] * (1.0 - dt) + project[idx + 1, n] * dt
+            else:
+                # assign edge value
+                for n in range(nproj):
+                    proj[t, n] = project[last_row_idx, n]
+
+        # calcanm: projf = proj @ simul.T  (simul assumed to be the matrix returned by setupprojs)
+        projf = np.empty((nphi, nproj), dtype=rawdat.dtype)
+        for t in range(nphi):
+            for i_col in range(nproj):
+                s = 0.0
+                for j in range(nproj):
+                    s += proj[t, j] * simul[i_col, j]
+                projf[t, i_col] = s
+        # anm_matrix[yfixed] = projf
+        anm = np.empty((nphi, nproj), dtype=rawdat.dtype)
+        for i_row in range(nphi):
+            for j_col in range(nproj):
+                s = 0.0
+                for k in range(nphi):
+                    s += sininv_mat[i_row, k] * projf[k, j_col]
+                anm[i_row, j_col] = 0.5 * s
+        # store the final anm (not projf) so output matches original getrho
+        anm_matrix[yfixed, :, :] = anm
+
+        # # anm = 0.5 * sininv_mat @ projf
+        # anm = np.empty((nphi, nproj), dtype=rawdat.dtype)
+        # for i_row in range(nphi):
+        #     for j_col in range(nproj):
+        #         s = 0.0
+        #         for k in range(nphi):
+        #             s += sininv_mat[i_row, k] * projf[k, j_col]
+        #         anm[i_row, j_col] = 0.5 * s
+
+        # calcrho: loop over projections, build zernike recursion and dot with weights
+        # r is (xsize,) radial grid
+        for ii in range(nproj):
+            # slice anm from ni[ii] .. nphi-1
+            start = ni[ii]
+            # build local anm_slice length L = nphi - start (but we only use up to coeff_count[ii])
+            L = nphi - start
+            # apply consistency_condition: zero small anm parts if nn>0 (original behavior)
+            # Here we mimic that: zero first nn[ii]//2 elements of the slice (if they exist)
+            # (we must be careful not to go out of bounds)
+            # We'll copy necessary entries into a small local array 'anm_slice_use' of length coeff_count[ii]
+            cc = coeff_count[ii]
+            if cc == 0:
+                # leave rho column zero
+                for rr in range(xsize):
+                    rhoreturn[rr, ii, yfixed] = 0.0
+                continue
+
+            anm_slice_use = np.empty(cc, dtype=rawdat.dtype)
+            # fill anm_slice_use from anm[start + k, ii]
+            for k in range(cc):
+                val = anm[start + k, ii]
+                # apply consistency: zero if k < nn[ii]//2 and nn[ii] > 0
+                if nn[ii] > 0 and k < (nn[ii] // 2):
+                    anm_slice_use[k] = 0.0
+                else:
+                    anm_slice_use[k] = val
+
+            # compute weights: (2*(m+1)-1 + nn) * anm_slice_use[m]
+            weights = np.empty(cc, dtype=rawdat.dtype)
+            for m in range(cc):
+                weights[m] = (2.0 * (m + 1) - 1.0 + nn[ii]) * anm_slice_use[m]
+
+            # compute zernike recursion for this nn[ii] and cc -> zern (xsize, cc)
+            zern = np.empty((xsize, cc), dtype=rawdat.dtype)
+            # first column
+            if cc >= 1:
+                if nn[ii] == 0:
+                    for rr in range(xsize):
+                        zern[rr, 0] = 1.0
+                else:
+                    for rr in range(xsize):
+                        zern[rr, 0] = r[rr] ** nn[ii]
+            if cc >= 2:
+                for rr in range(xsize):
+                    zern[rr, 1] = zern[rr, 0] * ((nn[ii] + 2.0) * (r[rr] ** 2) - (nn[ii] + 1.0))
+            for l in range(2, cc):
+                m = l - 1
+                m2 = nn[ii] + 2 * m
+                m1 = m2 + 2
+                denom = l * m2 * (nn[ii] + l)
+                for rr in range(xsize):
+                    num = ((nn[ii] + l + m) *
+                           (m2 * (m1 * (r[rr] ** 2) - nn[ii] - 1.0) - 2.0 * (m ** 2)) * zern[rr, l - 1] -
+                           m * (nn[ii] + m) * m1 * zern[rr, l - 2])
+                    zern[rr, l] = num / denom
+
+            # dot product zern dot weights -> contrib for each radius
+            for rr in range(xsize):
+                s = 0.0
+                for m in range(cc):
+                    s += zern[rr, m] * weights[m]
+                # multiply by rhofn_array per-radius
+                val = s * rhofn_array[rr]
+                # clip negative
+                # if val < 0.0:
+                #     val = 0.0
+                rhoreturn[rr, ii, yfixed] = val
+
+    return rhoreturn, anm_matrix
+
+
+# def getrho(rawdat, order, nproj, calib, pang, nphi, ncoeff, rhofn, sinmat):
+def getrho_training_data(rawdat, order, pang, nphi, ncoeff, rhofn):
+    """
+    Wrapper: precompute matrices and indices in Python (NumPy), then call njit core.
+    """
+    nproj = rawdat.shape[2]         # Should have shape (nsize, nsize, nproj)
+    nsize = rawdat.shape[0]
+    xsize = nsize // 2
+    xstart = nsize // 2
+
+    # precompute projection matrix inverse and sin inverse (as full 2D arrays)
+    simul = setupprojs(order, pang, nproj)  # returns (nproj,nproj) matrix (already the inverse)
+    sinmat_flat = setupsin(nphi)            # flattened Fortran-order inverse
+    sininv_mat = sinmat_flat.reshape((nphi, nphi), order='F')
+
+    # prepare rhofn array (fermi cutoff)
+    rhocut, flvl, kt = rhofn[0], rhofn[1], rhofn[2]
+    rhofn_array = rhocutoff(xsize, rhocut, flvl, kt)
+
+    # precompute calccos indices and interpolation
+    deltaphi = 90.0 / nphi
+    angles = np.linspace(0.0, 90.0, nphi, endpoint=True) * np.pi / 180.0
+    dists = (xsize - 1) * np.cos(angles)
+    i_idx = np.floor(dists).astype(np.int64)
+    deltax = dists - i_idx
+    valid_mask = (i_idx >= 0) & (i_idx < xsize - 1)
+
+    # precompute zernike parameters
+    r, coeff_count, nn, ni = precompute_zernike(xsize, nproj, order, nphi, ncoeff)
+
+    # call compiled core
+    rhoreturn, anm = _training_getrho_core(rawdat, simul, sininv_mat, i_idx, deltax, valid_mask,
+                             r, coeff_count, nn, ni, rhofn_array, float(order), nphi, int(xstart), int(xsize))
+    return rhoreturn, anm
 
 
 
@@ -1946,7 +2142,7 @@ def make_realistic_projections(raw_projs, sigma_x=0.11, sigma_y=0.137, projectio
         proj = apply_elliptical_gaussian(proj, sigma_x, sigma_y, projection_size_au, N=N)
         # # 2. MSF convolution (placeholder)
         # c_simulated = np.loadtxt("c_simulated_129x129.txt").reshape((N, N))  # Load the simulated camera response
-        c_simulated = np.loadtxt("c_simulated_513x513.txt").reshape((N, N))  # Load the simulated camera response
+        c_simulated = np.loadtxt("/c_simulated_513x513.txt").reshape((N, N))  # Load the simulated camera response
         msf = MSF_convolution(c_simulated, grid_size=proj.shape)    # <-- FIXED HERE
         proj = proj * msf                                        
         msf_stack.append(msf)
