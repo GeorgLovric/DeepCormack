@@ -6,7 +6,7 @@ from MCM_functions_new import *
 
 #############################################################################
 """Defining Training Data Parameters"""
-n_samples = 500                                                             # Number of 3D TPMD samples to generate                                      
+n_samples = 50000                                                             # Number of 3D TPMD samples to generate                                      
 sigma = 2    
 #############################################################################
 """Defining Modified Cormack Method Parameters"""
@@ -36,8 +36,15 @@ base_dir = "Data_Generation_Required/TPMD_Data"
 rho_real_dir = os.path.join(base_dir, "Rho_Measurement")
 os.makedirs(rho_real_dir, exist_ok=True)
 
-rho_ideal_dir = os.path.join(base_dir, "Rho_GroundTruth")
+rho_ideal_dir = os.path.join(base_dir, "Rho_Ideal")
 os.makedirs(rho_ideal_dir, exist_ok=True)
+
+
+ideal_td_dir = os.path.join(base_dir, "Proj_Ideal")
+os.makedirs(ideal_td_dir, exist_ok=True)
+
+measurement_td_dir = os.path.join(base_dir, "Proj_Measurement")
+os.makedirs(measurement_td_dir, exist_ok=True)
 #############################################################################
 
 """ --- Generating High-Quality TPMD Central Slices using PCA on Copper 3D TPMD ---
@@ -224,4 +231,56 @@ nphi = 180
 _, anm_arr = getrho_training_data(projections_stacked, order, pangzr, nphi, ncoeffs, rhofn_PCA)
 
 
+model = train_pca_dmd_per_channel(anm_Cu, latent_dim=24)
 
+# for i in range(anm_arr.shape[0]):
+for i in range(1):
+    predicted = rollout_per_channel(model, anm_arr[i], n_steps=256)
+    rhos_evolved = anm_to_rhos(predicted, order, rhofn, ncoeffs)
+
+    print(predicted.shape)
+    print(rhos_evolved.shape)
+
+    Rand_vol_evolved = calcplane(rhos_evolved, rhos_evolved.shape[2], order)
+
+    synth_tpmd_projections = compute_projections_stacked(
+        Rand_vol_evolved,
+        angles_to_extract
+    )
+
+
+
+    full_synth_tpmd_projections = np.concatenate([np.flip(synth_tpmd_projections, axis=1), synth_tpmd_projections], axis=1)
+
+
+    reconstruction, _ = getrho(full_synth_tpmd_projections, order, pang, nphi, 20 * [120], rhofn_PCA)
+    MCM = calcplane(reconstruction, reconstruction.shape[2], order)
+
+    # Apply experimental noise and realistic conditions to the projections
+    comp_pang = np.array([0, 12.2, 24, 35, 45])
+    # comp_pang = np.linspace(0, 45, num=5)
+    selected_indices = [np.abs(pang - val).argmin() for val in comp_pang]
+    pang_measure = pang[selected_indices]
+    measure_projs = upsample(np.array([full_synth_tpmd_projections[:, :, i] for i in selected_indices]).transpose(1, 2, 0))
+
+    # Apply realistic projection processing
+    realistic_projs = make_realistic_projections(
+        measure_projs,
+        sigma_x=0.11, sigma_y=0.137,
+        projection_size_au=5.0,
+        total_counts=count_ttl,
+        four_sym=True
+    )
+
+    reconstruction_measure, _ = getrho(realistic_projs, order, pang_measure, nphi, 5 * [120], rhofn_PCA)
+    MCM_measure = calcplane(reconstruction_measure, reconstruction_measure.shape[2], order)
+    
+    
+    
+    """ --- Saving the Projection Data ---"""
+    # Indices to extract (rounded to nearest integer)
+    y_indices = np.round(np.linspace(0, 100, 10)).astype(int)
+
+    # Save to text file in ideal_td_dir
+    save_path = os.path.join(ideal_td_dir, f"proj_ideal_{i}.txt")
+    np.savetxt(save_path, synth_tpmd_projections[:, y_indices, :].flatten())
