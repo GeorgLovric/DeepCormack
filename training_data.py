@@ -6,7 +6,7 @@ from MCM_functions_new import *
 
 #############################################################################
 """Defining Training Data Parameters"""
-n_samples = 50000                                                             # Number of 3D TPMD samples to generate                                      
+n_samples = 1                                                             # Number of 3D TPMD samples to generate                                      
 sigma = 2    
 #############################################################################
 """Defining Modified Cormack Method Parameters"""
@@ -33,18 +33,24 @@ num_simulations = 1                                                         # Nu
 count_ttl = 200_000_000                                                     # What should the simulated total counts be? ≈200,000,000 corresponds to 3 months of measurements!
 
 base_dir = "Data_Generation_Required/TPMD_Data"
-rho_real_dir = os.path.join(base_dir, "Rho_Measurement")
-os.makedirs(rho_real_dir, exist_ok=True)
+
+proj_ideal_dir = os.path.join(base_dir, "Proj_Ideal")
+os.makedirs(proj_ideal_dir, exist_ok=True)
+
+proj_meas_dir = os.path.join(base_dir, "Proj_Measurement")
+os.makedirs(proj_meas_dir, exist_ok=True)
 
 rho_ideal_dir = os.path.join(base_dir, "Rho_Ideal")
 os.makedirs(rho_ideal_dir, exist_ok=True)
 
+rho_meas_dir = os.path.join(base_dir, "Rho_Measurement")
+os.makedirs(rho_meas_dir, exist_ok=True)
 
-ideal_td_dir = os.path.join(base_dir, "Proj_Ideal")
-os.makedirs(ideal_td_dir, exist_ok=True)
+tpmd_ideal_dir = os.path.join(base_dir, "TPMD_Ideal")
+os.makedirs(tpmd_ideal_dir, exist_ok=True)
 
-measurement_td_dir = os.path.join(base_dir, "Proj_Measurement")
-os.makedirs(measurement_td_dir, exist_ok=True)
+tpmd_meas_dir = os.path.join(base_dir, "TPMD_Measurement")
+os.makedirs(tpmd_meas_dir, exist_ok=True)
 #############################################################################
 
 """ --- Generating High-Quality TPMD Central Slices using PCA on Copper 3D TPMD ---
@@ -234,7 +240,7 @@ _, anm_arr = getrho_training_data(projections_stacked, order, pangzr, nphi, ncoe
 model = train_pca_dmd_per_channel(anm_Cu, latent_dim=24)
 
 # for i in range(anm_arr.shape[0]):
-for i in range(1):
+for i in tqdm(range(1), desc="Generating Projections, Rhos, and TPMD datasets"):
     predicted = rollout_per_channel(model, anm_arr[i], n_steps=256)
     rhos_evolved = anm_to_rhos(predicted, order, rhofn, ncoeffs)
 
@@ -243,19 +249,14 @@ for i in range(1):
 
     Rand_vol_evolved = calcplane(rhos_evolved, rhos_evolved.shape[2], order)
 
+    """ --- Taking Ideal Projections from the DMD 3D TPMD --- """
     synth_tpmd_projections = compute_projections_stacked(
         Rand_vol_evolved,
         angles_to_extract
     )
-
-
-
     full_synth_tpmd_projections = np.concatenate([np.flip(synth_tpmd_projections, axis=1), synth_tpmd_projections], axis=1)
 
-
-    reconstruction, _ = getrho(full_synth_tpmd_projections, order, pang, nphi, 20 * [120], rhofn_PCA)
-    MCM = calcplane(reconstruction, reconstruction.shape[2], order)
-
+    """ --- Simulating Realistic Measurement Projections from the Ideal Projections --- """
     # Apply experimental noise and realistic conditions to the projections
     comp_pang = np.array([0, 12.2, 24, 35, 45])
     # comp_pang = np.linspace(0, 45, num=5)
@@ -272,15 +273,45 @@ for i in range(1):
         four_sym=True
     )
 
-    reconstruction_measure, _ = getrho(realistic_projs, order, pang_measure, nphi, 5 * [120], rhofn_PCA)
+    # reconstruction, _ = getrho(full_synth_tpmd_projections, order, pang, nphi, 20 * [120], rhofn_PCA)
+    # MCM = calcplane(reconstruction, reconstruction.shape[2], order)
+    # reconstruction_measure, _ = getrho(realistic_projs, order, pang_measure, nphi, 5 * [120], rhofn_PCA)
+    # MCM_measure = calcplane(reconstruction_measure, reconstruction_measure.shape[2], order)
+    
+    
+    
+    """ --- Saving the Projection Data --- """
+    # Indices to extract (rounded to nearest integer)
+    centre = full_synth_tpmd_projections.shape[1] // 2
+    y_indices = np.round(np.linspace(centre, centre + 100, 10)).astype(int)
+
+    save_path_ideal = os.path.join(proj_ideal_dir, f"proj_ideal_{i}.txt")
+    np.savetxt(save_path_ideal, full_synth_tpmd_projections[:, y_indices, :].flatten())
+
+    save_path_meas = os.path.join(proj_meas_dir, f"proj_meas_{i}.txt")
+    np.savetxt(save_path_meas, realistic_projs[:, y_indices, :].flatten())
+    
+    
+    """ --- Saving the 3D Rho Data --- """
+    reconstruction_ideal, _ = getrho(full_synth_tpmd_projections[:, y_indices, :], order, pang, nphi, 20 * [120], rhofn_PCA)
+    reconstruction_measure, _ = getrho(realistic_projs[:, y_indices, :], order, pang_measure, nphi, 5 * [120], rhofn_PCA)
+    
+    save_path_ideal = os.path.join(rho_ideal_dir, f"rho_ideal_{i}.txt")
+    np.savetxt(save_path_ideal, reconstruction_ideal.flatten())
+
+    save_path_meas = os.path.join(rho_meas_dir, f"rho_meas_{i}.txt")
+    np.savetxt(save_path_meas, reconstruction_measure.flatten())
+
+
+    """ --- Saving the 3D TPMD Data --- """
+    MCM_ideal = calcplane(reconstruction_ideal, reconstruction_ideal.shape[2], order)
     MCM_measure = calcplane(reconstruction_measure, reconstruction_measure.shape[2], order)
     
-    
-    
-    """ --- Saving the Projection Data ---"""
-    # Indices to extract (rounded to nearest integer)
-    y_indices = np.round(np.linspace(0, 100, 10)).astype(int)
-
     # Save to text file in ideal_td_dir
-    save_path = os.path.join(ideal_td_dir, f"proj_ideal_{i}.txt")
-    np.savetxt(save_path, synth_tpmd_projections[:, y_indices, :].flatten())
+    save_path_ideal = os.path.join(tpmd_ideal_dir, f"tpmd_ideal_{i}.txt")
+    np.savetxt(save_path_ideal, MCM_ideal.flatten())
+
+    save_path_meas = os.path.join(tpmd_meas_dir, f"tpmd_meas_{i}.txt")
+    np.savetxt(save_path_meas, MCM_measure.flatten())
+    
+print("Data generation complete.")
