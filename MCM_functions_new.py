@@ -1229,6 +1229,37 @@ def compute_projections_stacked(TPMD_Slices, angles_to_extract=np.linspace(0, 45
     return projections
 
 
+def adjust_rho0_maxima(normalize_rhoreturn_ideal, rhoreturn_ideal_Cu, percent=0.10, rng=None, rhocut=1, kt=6.0):
+    """
+    For each idx and each i in 0..N, rescales normalize_rhoreturn_ideal[:, i, idx] so its maximum is a random value
+    within ±percent of the absolute maximum of rhoreturn_ideal_Cu[:, i, 0], then applies rhocutoff.
+    For i=0, uses flvl=100; for all other i, uses flvl=35.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    adjusted = np.copy(normalize_rhoreturn_ideal)
+    xsize = normalize_rhoreturn_ideal.shape[0]
+    n_i = normalize_rhoreturn_ideal.shape[1]
+    n_idx = normalize_rhoreturn_ideal.shape[2]
+    for idx in range(n_idx):
+        for i in range(n_i):
+            target_max = np.max(np.abs(rhoreturn_ideal_Cu[:, i, 0]))
+            if i == 0:
+                upper = target_max * (1 + 0.05)
+                lower = target_max * (1 - 0.05)
+            else:
+                lower = target_max * (1 - percent/2)
+                upper = target_max * (1 + percent)
+            new_max = rng.uniform(lower, upper)
+            current_max = np.max(np.abs(normalize_rhoreturn_ideal[:, i, idx]))
+            flvl_val = 128 if i == 0 else 100
+            cutoff = rhocutoff(xsize, rhocut, flvl_val, kt)
+            if current_max != 0:
+                adjusted[:, i, idx] = normalize_rhoreturn_ideal[:, i, idx] * (new_max / current_max) * cutoff
+            else:
+                adjusted[:, i, idx] = 0
+    return adjusted
+
 
 
 ### Modified numba getrho function to be able to synthesize large amounts of central slices stacked together ###
@@ -2121,6 +2152,38 @@ def symmetrize_4fold_even(image):
 
 #total_counts = 2_000_000  # Total counts for each projection, can be adjusted as needed
 
+def downsample(arr):
+    """
+    Downsample a (513, 513, nproj) or (513, 513) array to (512, 512, nproj) or (512, 512) using scipy.ndimage.zoom.
+    Handles both 2D and 3D arrays.
+    """
+    dims = arr.shape[0]
+    if arr.ndim == 3:
+        downsampled = np.zeros((dims-1, dims-1, arr.shape[2]), dtype=arr.dtype)
+        for i in range(arr.shape[2]):
+            downsampled[:, :, i] = zoom(arr[:, :, i], zoom=((dims-1)/dims, (dims-1)/dims), order=1)
+    elif arr.ndim == 2:
+        downsampled = zoom(arr, zoom=((dims-1)/dims, (dims-1)/dims), order=1)
+    else:
+        raise ValueError("Input array must be 2D or 3D.")
+    return downsampled
+
+def upsample(arr):
+    """
+    Upsample a (512, 512, nproj) or (512, 512) array to (513, 513, nproj) or (513, 513) using scipy.ndimage.zoom.
+    Handles both 2D and 3D arrays.
+    """
+    dims = arr.shape[0]
+    if arr.ndim == 3:
+        upsampled = np.zeros((dims+1, dims+1, arr.shape[2]), dtype=arr.dtype)
+        for i in range(arr.shape[2]):
+            upsampled[:, :, i] = zoom(arr[:, :, i], zoom=((dims+1)/dims, (dims+1)/dims), order=1)
+    elif arr.ndim == 2:
+        upsampled = zoom(arr, zoom=((dims+1)/dims, (dims+1)/dims), order=1)
+    else:
+        raise ValueError("Input array must be 2D or 3D.")
+    return upsampled
+
 def make_realistic_projections(raw_projs, sigma_x=0.11, sigma_y=0.137, projection_size_au=5.0, total_counts=0, four_sym=None):
     """
     raw_projs: shape (N, N, nproj)
@@ -2134,15 +2197,16 @@ def make_realistic_projections(raw_projs, sigma_x=0.11, sigma_y=0.137, projectio
     """
     #### projection_size_au=6.87 for ZrZn2 Data
     N, _, nproj = raw_projs.shape
-    processed = np.zeros_like(raw_projs)
+    processed = np.zeros((N-1, N-1, nproj), dtype=raw_projs.dtype)
     msf_stack = []
     for idx in range(nproj):
         proj = raw_projs[:, :, idx]
         # 1. Elliptical detector convolution
         proj = apply_elliptical_gaussian(proj, sigma_x, sigma_y, projection_size_au, N=N)
         # # 2. MSF convolution (placeholder)
-        # c_simulated = np.loadtxt("c_simulated_129x129.txt").reshape((N, N))  # Load the simulated camera response
-        c_simulated = np.loadtxt("/c_simulated_513x513.txt").reshape((N, N))  # Load the simulated camera response
+        # c_simulated = np.loadtxt("Data_Generation_Required/c_simulated_513x513.txt").reshape((N, N))  # Load the simulated camera response
+        c_simulated = np.loadtxt("Data_Generation_Required/c_simulated_513x513.txt").reshape((N, N))  # Load the simulated camera response
+
         msf = MSF_convolution(c_simulated, grid_size=proj.shape)    # <-- FIXED HERE
         proj = proj * msf                                        
         msf_stack.append(msf)
@@ -2154,11 +2218,11 @@ def make_realistic_projections(raw_projs, sigma_x=0.11, sigma_y=0.137, projectio
 
         # 4. Poisson noise (integer counts)
         proj_torch = torch.tensor(proj, dtype=torch.float32)
-        proj_noisy = torch.poisson(proj_torch).numpy()
+        proj_noisy = (torch.poisson(proj_torch).numpy())
         # proj_noisy = proj.copy()                              # To Test Without Noise
         
         # 5. Divide by MSF (avoid division by zero)
-        proj_final = np.where(msf != 0, proj_noisy / msf, 0)
+        proj_final = downsample(np.where(msf != 0, proj_noisy / msf, 0))
         
         """new addition: normalize projections"""
         if np.sum(proj_final) > 0:
@@ -2166,7 +2230,7 @@ def make_realistic_projections(raw_projs, sigma_x=0.11, sigma_y=0.137, projectio
 
         if four_sym==True:
             # 6. Enforce 4-fold symmetry
-            proj_final = symmetrize_4fold(proj_final)  # Enforce 4-fold symmetry
+            proj_final = symmetrize_4fold_even(proj_final)  # Enforce 4-fold symmetry
                   
         processed[:, :, idx] = proj_final
     return processed
