@@ -1222,7 +1222,8 @@ def compute_projections_stacked(TPMD_Slices, angles_to_extract=np.linspace(0, 45
     nproj = len(angles_to_extract)
     projections = np.zeros((TPMD_Slices.shape[0], n_samples, nproj))
     
-    for i in tqdm(range(n_samples), desc="Computing anm_arr for samples"):
+    # for i in tqdm(range(n_samples), desc="Computing anm_arr for samples"):
+    for i in range(n_samples):
         xz_slice = TPMD_Slices[:, i, :]  # Shape (512, 512)
         sinogram = radon(xz_slice, theta=angles_to_extract, circle=True)
         projections[:, i, :] = sinogram                        #[:, angle_indices]  # Shape (512, nproj)
