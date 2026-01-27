@@ -4,10 +4,32 @@
 # conda env create -f environment.yml
 from MCM_functions_new import *
 
+
+
+#############################################################################
+# Set random seed for reproducibility
+SEED = 42  
+np.random.seed(SEED)
+random.seed(SEED)
+
+# If you use scikit-learn or other libraries that use randomness:
+try:
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+except ImportError:
+    pass
+
+try:
+    os.environ['PYTHONHASHSEED'] = str(SEED)
+except Exception:
+    pass
+
 #############################################################################
 """Defining Training Data Parameters"""
 n_samples = 2                                                              # Number of 3D TPMD samples to generate                                      
-sigma = 2    
+sigma = 3    
 #############################################################################
 """Defining Modified Cormack Method Parameters"""
 
@@ -30,28 +52,15 @@ rhofn_PCA = [0, 200, 3.0]
 
 # Generating Experimental Data.
 num_simulations = 1                                                         # Number of simulated 3D TPMD datasets to generate                               
-count_ttl = 200_000_000                                                     # What should the simulated total counts be? ≈200,000,000 corresponds to 3 months of measurements!
+count_ttl = [200_000_000, 
+             100_000_000, 
+             50_000_000, 
+             10_000_000, 
+             1_000_000]                                                     # What should the simulated total counts be? ≈200,000,000 corresponds to 3 months of measurements!
+
 
 base_dir = "Data_Generation_Required/TPMD_Data"
-base_dir_meas = os.path.join(base_dir, f"{count_ttl // 1_000_000}M_Counts")
 
-proj_ideal_dir = os.path.join(base_dir, "Proj_Ideal")
-os.makedirs(proj_ideal_dir, exist_ok=True)
-
-proj_meas_dir = os.path.join(base_dir_meas, "Proj_Measurement")
-os.makedirs(proj_meas_dir, exist_ok=True)
-
-rho_ideal_dir = os.path.join(base_dir, "Rho_Ideal")
-os.makedirs(rho_ideal_dir, exist_ok=True)
-
-rho_meas_dir = os.path.join(base_dir_meas, "Rho_Measurement")
-os.makedirs(rho_meas_dir, exist_ok=True)
-
-tpmd_ideal_dir = os.path.join(base_dir, "TPMD_Ideal")
-os.makedirs(tpmd_ideal_dir, exist_ok=True)
-
-tpmd_meas_dir = os.path.join(base_dir_meas, "TPMD_Measurement")
-os.makedirs(tpmd_meas_dir, exist_ok=True)
 
 # # Directory to save side-by-side images
 # tpmd_image_dir = os.path.join(base_dir_meas, "TPMD_Image")
@@ -95,7 +104,7 @@ for k in range(anm_pca.shape[2]):  # iterate over 20 functions
     X_centered = X - X.mean(axis=0, keepdims=True)
 
     # Fit PCA across slices
-    pca = PCA(n_components=n_components)
+    pca = PCA(n_components=n_components, random_state=SEED)
     Z = pca.fit_transform(X_centered)                                       # shape (256, n_components)
 
     latent_spaces.append(Z)
@@ -147,7 +156,6 @@ rhoreturn_synth_norm, max_vals_synth = normalize_rhoreturn_ideal_Cu(rhoreturn_sy
 # List to collect only successful candidates
 successful_slices = []
 
-sigma = 3  # Adjust as needed
 
 for idx in range(rhoreturn_synth_norm.shape[2]):
     # Smooth all slices for this idx
@@ -269,15 +277,7 @@ for i in tqdm(range(anm_arr.shape[0]), desc="Generating Projections, Rhos, and T
     selected_indices = [np.abs(pang - val).argmin() for val in comp_pang]
     pang_measure = pang[selected_indices]
     measure_projs = upsample(np.array([full_synth_tpmd_projections[:, :, i] for i in selected_indices]).transpose(1, 2, 0))
-
-    # Apply realistic projection processing
-    realistic_projs = make_realistic_projections(
-        measure_projs,
-        sigma_x=0.11, sigma_y=0.137,
-        projection_size_au=5.0,
-        total_counts=count_ttl,
-        four_sym=True
-    )
+    
 
     # reconstruction, _ = getrho(full_synth_tpmd_projections, order, pang, nphi, 20 * [120], rhofn_PCA)
     # MCM = calcplane(reconstruction, reconstruction.shape[2], order)
@@ -285,73 +285,126 @@ for i in tqdm(range(anm_arr.shape[0]), desc="Generating Projections, Rhos, and T
     # MCM_measure = calcplane(reconstruction_measure, reconstruction_measure.shape[2], order)
     
     
+    proj_ideal_dir = os.path.join(base_dir, "Proj_Ideal")
+    os.makedirs(proj_ideal_dir, exist_ok=True)
+
+    rho_ideal_dir = os.path.join(base_dir, "Rho_Ideal")
+    os.makedirs(rho_ideal_dir, exist_ok=True)
+
+    tpmd_ideal_dir = os.path.join(base_dir, "TPMD_Ideal")
+    os.makedirs(tpmd_ideal_dir, exist_ok=True)
     
-    """ --- Saving the Projection Data --- """
     # Indices to extract (rounded to nearest integer)
     centre = full_synth_tpmd_projections.shape[1] // 2
     increments = 10
     y_indices = np.round(np.arange(centre, centre + 50, increments)).astype(int)       # Saving projection from centre (idx 256) to
 
+
+    """ --- Saving the Projection Data --- """
     save_ideal_proj = full_synth_tpmd_projections[:, y_indices, :]
-    save_meas_proj = realistic_projs[:, y_indices, :]
+    
 
     # Should have shape (N, len(y_indices), nproj) ––> flattened to 512 * 5 * 20 = 51,200
     save_path_ideal = os.path.join(proj_ideal_dir, f"proj_ideal_{i}.txt")
     np.savetxt(save_path_ideal, save_ideal_proj.flatten())
     
-    # Should have shape (N, len(y_indices), nproj) ––> flattened to 512 * 5 * 5 = 12,800
-    save_path_meas = os.path.join(proj_meas_dir, f"proj_meas_{i}.txt")
-    np.savetxt(save_path_meas, save_meas_proj.flatten())
-    
-    
     
     """ --- Saving the 3D Rho Data --- """
     reconstruction_ideal, _ = getrho_training_data(save_ideal_proj, order, pang, nphi, 20 * [120], rhofn_PCA)
-    reconstruction_measure, _ = getrho_training_data(save_meas_proj, order, pang_measure, nphi, 5 * [120], rhofn_PCA)
-
+    # print(reconstruction_ideal.shape)
+    
     # Should have shape (N/2, nproj, len(y_indices)) ––> flattened to 256 * 20 * 5 = 25,600
     save_path_ideal = os.path.join(rho_ideal_dir, f"rho_ideal_{i}.txt")
     np.savetxt(save_path_ideal, reconstruction_ideal.flatten())
-
-    # Should have shape (N/2, nproj, len(y_indices)) ––> flattened to 256 * 5 * 5 = 6,400
-    save_path_meas = os.path.join(rho_meas_dir, f"rho_meas_{i}.txt")
-    np.savetxt(save_path_meas, reconstruction_measure.flatten())
     
-    # print(reconstruction_ideal.shape)
-
-
     """ --- Saving the 3D TPMD Data (Upper-Left Quadrant) --- """
     MCM_ideal = calcplane(reconstruction_ideal, reconstruction_ideal.shape[2], order)
-    MCM_measure = calcplane(reconstruction_measure, reconstruction_measure.shape[2], order)
-
-    # img_indices = np.round(np.arange(len(y_indices))).astype(int)
-
+    
+    
     # Should have shape (N/2, len(y_indices), N/2) ––> flattened to 256 * 5 * 256 = 327,680
     save_path_ideal = os.path.join(tpmd_ideal_dir, f"tpmd_ideal_{i}.txt")
     np.savetxt(save_path_ideal, MCM_ideal[:centre, :, :centre].flatten())
     
-    # Should have shape (N/2, len(y_indices), N/2) ––> flattened to 256 * 5 * 256 = 327,680
-    save_path_meas = os.path.join(tpmd_meas_dir, f"tpmd_meas_{i}.txt")
-    np.savetxt(save_path_meas, MCM_measure[:centre, :, :centre].flatten())
+    
+    for counts in count_ttl:
+        
+        base_dir_meas = os.path.join(base_dir, f"{counts // 1_000_000}M_Counts")
 
-    # Visualize and save the 3D TPMD Data as side-by-side images
-    # 
-    # print(img_indices)
-    for j in range(MCM_ideal.shape[1]):
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-        axes[0].imshow(MCM_ideal[:, j, :], cmap='hot', aspect='auto')
-        axes[0].axis('off')
-        # axes[0].set_title('Ideal')
-        axes[1].imshow(MCM_measure[:, j, :], cmap='hot', aspect='auto')
-        axes[1].axis('off')
-        # axes[1].set_title('Measurement')
-        plt.subplots_adjust(left=0, right=1, top=1, bottom=0, wspace=0.01)
+        proj_meas_dir = os.path.join(base_dir_meas, "Proj_Measurement")
+        os.makedirs(proj_meas_dir, exist_ok=True)
+
+        rho_meas_dir = os.path.join(base_dir_meas, "Rho_Measurement")
+        os.makedirs(rho_meas_dir, exist_ok=True)
+
+        tpmd_meas_dir = os.path.join(base_dir_meas, "TPMD_Measurement")
+        os.makedirs(tpmd_meas_dir, exist_ok=True)
+                
+
+        # Apply realistic projection processing
+        realistic_projs = make_realistic_projections(
+            measure_projs,
+            sigma_x=0.11, sigma_y=0.137,
+            projection_size_au=5.0,
+            total_counts=counts,
+            four_sym=True
+        )
         
-        tpmd_folder = os.path.join(base_dir_meas, "TPMD_Image", f"TPMD_{i}")
-        os.makedirs(tpmd_folder, exist_ok=True)
-        save_img_path = os.path.join(tpmd_folder, f"Slice_{increments * j}.png")
-        plt.savefig(save_img_path, bbox_inches='tight', pad_inches=0)
-        
-        plt.close(fig)
+        """ --- Saving the Projection Data --- """
+        save_meas_proj = realistic_projs[:, y_indices, :]
+    
+        # Should have shape (N, len(y_indices), nproj) ––> flattened to 512 * 5 * 5 = 12,800
+        save_path_meas = os.path.join(proj_meas_dir, f"proj_meas_{i}.txt")
+        np.savetxt(save_path_meas, save_meas_proj.flatten())
+    
+    
+        """ --- Saving the 3D Rho Data --- """
+        reconstruction_measure, _ = getrho_training_data(save_meas_proj, order, pang_measure, nphi, 5 * [120], rhofn_PCA)
+
+        # Should have shape (N/2, nproj, len(y_indices)) ––> flattened to 256 * 5 * 5 = 6,400
+        save_path_meas = os.path.join(rho_meas_dir, f"rho_meas_{i}.txt")
+        np.savetxt(save_path_meas, reconstruction_measure.flatten())
+    
+    
+        """ --- Saving the 3D TPMD Data (Upper-Left Quadrant) --- """
+        MCM_measure = calcplane(reconstruction_measure, reconstruction_measure.shape[2], order)
+    
+        # Should have shape (N/2, len(y_indices), N/2) ––> flattened to 256 * 5 * 256 = 327,680
+        save_path_meas = os.path.join(tpmd_meas_dir, f"tpmd_meas_{i}.txt")
+        np.savetxt(save_path_meas, MCM_measure[:centre, :, :centre].flatten())
+
+
+        """ --- Visualizing and Saving Side-by-Side Images of Ideal vs Measurement TPMD Slices --- """
+        # Visualize and save the 3D TPMD Data as side-by-side images
+        for j in range(MCM_ideal.shape[1]):
+            vmin = min(np.quantile(MCM_measure[:, j, :], 0.00), np.quantile(MCM_ideal[:, j, :], 0.00))
+            vmax = max(np.quantile(MCM_measure[:, j, :], 1.00), np.quantile(MCM_ideal[:, j, :], 1.00))
+
+            fig, axes = plt.subplots(1, 3, figsize=(12, 6))
+            im0 = axes[0].imshow(MCM_ideal[:, j, :], cmap='hot', aspect='equal', origin='lower', vmin=vmin, vmax=vmax)
+            axes[0].axis('off')
+            # axes[0].set_title('Ideal')
+            # plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, location="left")
+            
+            im1 = axes[1].imshow(MCM_measure[:, j, :], cmap='hot', aspect='equal', origin='lower', vmin=vmin, vmax=vmax)
+            axes[1].axis('off')
+            # axes[1].set_title('Measurement')
+            # plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+            percent_diff = 100 * (MCM_ideal[:, j, :] - MCM_measure[:, j, :]) / (np.max(np.abs(MCM_measure[:, j, :])))
+            perc_range = np.max(np.abs(percent_diff))
+
+            im2 = axes[2].imshow(np.abs(percent_diff), cmap='seismic', origin='lower', aspect='equal', vmin=-perc_range, vmax=perc_range)
+            axes[2].axis('off')
+            plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0, wspace=0.01)
+            
+            tpmd_folder = os.path.join(base_dir_meas, "TPMD_Image", f"TPMD_{i}")
+            os.makedirs(tpmd_folder, exist_ok=True)
+            save_img_path = os.path.join(tpmd_folder, f"Slice_{increments * j}.png")
+            plt.savefig(save_img_path, bbox_inches='tight', pad_inches=0)
+            
+            plt.close(fig)
+
 
 print("Data generation complete.")

@@ -1201,6 +1201,7 @@ def rollout_per_channel(models, x0, n_steps):
     return all_channels  # shape (n_steps, 180, 20)
 
 
+
 # Taking projections of generated TPMD Central Slices
 def compute_projections_stacked(TPMD_Slices, angles_to_extract=np.linspace(0, 45, 20, endpoint=True)):
     """
