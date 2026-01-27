@@ -11,6 +11,7 @@ from MCM_functions_new import *
 SEED = 42  
 np.random.seed(SEED)
 random.seed(SEED)
+rng = np.random.RandomState(SEED)           # For sampling random slices each time it is run
 
 # If you use scikit-learn or other libraries that use randomness:
 try:
@@ -297,7 +298,12 @@ for i in tqdm(range(anm_arr.shape[0]), desc="Generating Projections, Rhos, and T
     # Indices to extract (rounded to nearest integer)
     centre = full_synth_tpmd_projections.shape[1] // 2
     increments = 10
-    y_indices = np.round(np.arange(centre, centre + 50, increments)).astype(int)       # Saving projection from centre (idx 256) to
+    all_indices = np.arange(centre, centre + 102)  # inclusive of centre+101
+    num_samples = 6  # total number of indices you want (including centre)
+    sampled = rng.choice(all_indices[1:], size=num_samples - 1, replace=False)  # exclude centre for sampling
+    y_indices = np.concatenate(([centre], sampled))
+    y_indices = np.sort(y_indices)
+    # y_indices = np.round(np.arange(centre, centre + 50, increments)).astype(int)       # Saving projection from centre (idx 256) to
 
 
     """ --- Saving the Projection Data --- """
@@ -401,7 +407,7 @@ for i in tqdm(range(anm_arr.shape[0]), desc="Generating Projections, Rhos, and T
             
             tpmd_folder = os.path.join(base_dir_meas, "TPMD_Image", f"TPMD_{i}")
             os.makedirs(tpmd_folder, exist_ok=True)
-            save_img_path = os.path.join(tpmd_folder, f"Slice_{increments * j}.png")
+            save_img_path = os.path.join(tpmd_folder, f"Slice_{y_indices[j] - 256}.png")
             plt.savefig(save_img_path, bbox_inches='tight', pad_inches=0)
             
             plt.close(fig)
