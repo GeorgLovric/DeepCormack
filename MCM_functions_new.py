@@ -1464,11 +1464,18 @@ def getrho_training_data(rawdat, order, pang, nphi, ncoeff, rhofn):
 
 
 
-
-
-
-
-
+def precompute_y_indices(all_indices, num_samples, centre, n_items, rng):
+    """
+    Precompute y_indices for all items, so that you can resume from any index
+    and get the same result as if you started from 0.
+    """
+    y_indices_list = []
+    for _ in range(n_items):
+        sampled = rng.choice(all_indices[1:], size=num_samples - 1, replace=False)
+        y_indices = np.concatenate(([centre], sampled))
+        y_indices = np.sort(y_indices)
+        y_indices_list.append(y_indices)
+    return y_indices_list 
 
 
 

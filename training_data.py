@@ -29,13 +29,14 @@ except Exception:
 
 #############################################################################
 """Defining Training Data Parameters"""
-n_samples = 2                                                              # Number of 3D TPMD samples to generate                                      
+n_samples = 5                                                              # Number of 3D TPMD samples to generate – 2100 used for training data                                     
 sigma = 3    
 #############################################################################
 """Defining Modified Cormack Method Parameters"""
 
 N = 513                                                                     # image size (N x N pixels) of copper projections                                    
-raw_proj_dir = "Data_Generation_Required/Cu_20Projections(513)"             # directory containing ideal copper projections
+raw_proj_dir = "Data_Generation_Required/Cu_20Projections(513)"           # directory containing ideal copper projections
+# raw_proj_dir = "Cu_20Projections(513)"
 
 pang = np.linspace(0, 45, 20)                                               # projection angles for the 20 projections for the DFT copper data        
 ncoeffs = [150, 120, 100, 90, 80, 50]                                       # number of Chebyshev coefficients for each projection angle      
@@ -52,7 +53,7 @@ rhofn = [rhocut, flvl, kt]
 rhofn_PCA = [0, 200, 3.0]
 
 # Generating Experimental Data.
-num_simulations = 1                                                         # Number of simulated 3D TPMD datasets to generate                               
+# num_simulations = 1                                                         # Number of simulated 3D TPMD datasets to generate                               
 count_ttl = [200_000_000, 
              100_000_000, 
              50_000_000, 
@@ -61,6 +62,7 @@ count_ttl = [200_000_000,
 
 
 base_dir = "Data_Generation_Required/TPMD_Data"
+# base_dir = "/store/LION/gfbl2/DeepCormack_Data"
 
 
 # # Directory to save side-by-side images
@@ -254,6 +256,14 @@ print(anm_arr.shape)
 
 model = train_pca_dmd_per_channel(anm_Cu, latent_dim=24)
 
+
+centre = xsize
+all_indices = np.arange(centre, centre + 102)
+num_samples = 6
+n_items = anm_arr.shape[0]
+y_indices_list = precompute_y_indices(all_indices, num_samples, centre, n_items, rng)
+
+
 # for i in tqdm(range(1), desc="Generating Projections, Rhos, and TPMD datasets"):
 for i in tqdm(range(anm_arr.shape[0]), desc="Generating Projections, Rhos, and TPMD datasets"):
     predicted = rollout_per_channel(model, anm_arr[i], n_steps=256)
@@ -295,16 +305,17 @@ for i in tqdm(range(anm_arr.shape[0]), desc="Generating Projections, Rhos, and T
     tpmd_ideal_dir = os.path.join(base_dir, "TPMD_Ideal")
     os.makedirs(tpmd_ideal_dir, exist_ok=True)
     
-    # Indices to extract (rounded to nearest integer)
-    centre = full_synth_tpmd_projections.shape[1] // 2
-    increments = 10
-    all_indices = np.arange(centre, centre + 102)  # inclusive of centre+101
-    num_samples = 6  # total number of indices you want (including centre)
-    sampled = rng.choice(all_indices[1:], size=num_samples - 1, replace=False)  # exclude centre for sampling
-    y_indices = np.concatenate(([centre], sampled))
-    y_indices = np.sort(y_indices)
-    # y_indices = np.round(np.arange(centre, centre + 50, increments)).astype(int)       # Saving projection from centre (idx 256) to
-
+    # # Indices to extract (rounded to nearest integer)
+    # centre = full_synth_tpmd_projections.shape[1] // 2
+    # increments = 10
+    # all_indices = np.arange(centre, centre + 102)  # inclusive of centre+101
+    # num_samples = 6  # total number of indices you want (including centre)
+    # sampled = rng.choice(all_indices[1:], size=num_samples - 1, replace=False)  # exclude centre for sampling
+    # y_indices = np.concatenate(([centre], sampled))
+    # y_indices = np.sort(y_indices)
+    # # y_indices = np.round(np.arange(centre, centre + 50, increments)).astype(int)       # Saving projection from centre (idx 256) to
+    
+    y_indices = y_indices_list[i]
 
     """ --- Saving the Projection Data --- """
     save_ideal_proj = full_synth_tpmd_projections[:, y_indices, :]
